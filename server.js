@@ -1,0 +1,470 @@
+require("dotenv").config();
+const express = require("express");
+const mongoose = require("mongoose");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+const path = require("path");
+const app = express();
+
+/* ===================== CONNECT MONGODB ===================== */
+mongoose.connect(process.env.MONGO_URI)
+.then(() => console.log("✅ MongoDB Connected"))
+.catch(err => console.log("❌ Mongo Error:", err));
+
+/* ===================== PRIZE SETTING MODEL ===================== */
+const prizeSettingSchema = new mongoose.Schema({
+  values: {
+    type: Map,
+    of: Number
+  }
+});
+
+const PrizeSetting = mongoose.model("PrizeSetting", prizeSettingSchema);
+
+/* ===================== MIDDLEWARE ===================== */
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+/* ===================== MODELS ===================== */
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true },
+  password: String,
+  role: { type: String, default: "player" },
+  spinsLeft: { type: Number, default: 0 },
+  balance: { type: Number, default: 0 },
+
+  // 🔥 STREAK SYSTEM
+  streakCount: { type: Number, default: 0 },
+  lastSpinDate: { type: Date }
+});
+
+const spinSchema = new mongoose.Schema({
+  userId: String,
+  username: String,
+  prize: Number,
+  prizeLabel: String,   // 🔥 បន្ថែមបន្ទាត់នេះ
+  createdAt: { type: Date, default: Date.now }
+  
+});
+
+const User = mongoose.model("User", userSchema);
+const Spin = mongoose.model("Spin", spinSchema);
+
+/* ===================== VERIFY TOKEN ===================== */
+function verifyToken(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader)
+    return res.status(401).json({ message: "No token provided" });
+
+  const token = authHeader.split(" ")[1];
+
+  if (!token)
+    return res.status(401).json({ message: "Invalid token format" });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(403).json({ message: "Invalid or expired token" });
+  }
+}
+/* ===================== PRIZE SETTINGS API ===================== */
+
+// GET current probability
+app.get("/api/admin/prize-settings", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  try {
+    let setting = await PrizeSetting.findOne();
+
+    // ✅ FIX PROPER CHECK FOR MAP
+    if (!setting || !setting.values || setting.values.size === 0) {
+      setting = await PrizeSetting.findOneAndUpdate(
+        {},
+        {
+          values: {
+            0: 50,
+            5: 10,
+            10: 10,
+            20: 10,
+            30: 10,
+            50: 5,
+            100:4,
+            200:1
+          }
+        },
+        { upsert: true, new: true }
+      );
+    }
+
+    // ✅ IMPORTANT: convert Map → object properly
+    const valuesObject = setting.values instanceof Map
+      ? Object.fromEntries(setting.values)
+      : setting.values;
+
+    const result = Object.entries(valuesObject).map(([value, weight]) => ({
+      value: Number(value),
+      weight: Number(weight)
+    }));
+
+    res.json(result);
+
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+// SAVE probability (ADMIN)
+app.post("/api/admin/prize-settings", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  try {
+    const prizes = req.body; // expect array [{value, weight}]
+
+    if (!Array.isArray(prizes))
+      return res.status(400).json({ message: "Invalid data format" });
+
+    const valuesObject = {};
+    prizes.forEach(p => {
+      valuesObject[p.value] = Number(p.weight);
+    });
+
+    await PrizeSetting.findOneAndUpdate(
+      {},
+      { values: valuesObject },
+      { upsert: true }
+    );
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.log(err);
+    res.status(500).json({ message: "Error saving data" });
+  }
+});
+
+/* ===================== ADMIN LOGIN ===================== */
+/* ===================== ADMIN LOGIN ===================== */
+app.post("/admin-login", (req, res) => {
+  const { username, password } = req.body;
+
+  if (
+    (username === process.env.ADMIN_USER &&
+     password === process.env.ADMIN_PASS)
+
+     ||
+
+    (username === process.env.ADMIN_USER1 &&
+     password === process.env.ADMIN_PASS1)
+  ) {
+    const token = jwt.sign(
+  { role: "admin", username },
+  process.env.JWT_SECRET,
+  { expiresIn: "2h" }
+);
+
+    return res.json({ success: true, token });
+  }
+
+  res.json({ success: false, message: "Wrong Admin" });
+});
+
+/* ===================== PLAYER LOGIN ===================== */
+app.post("/player/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  const user = await User.findOne({ username });
+  if (!user) return res.json({ success: false });
+
+  const valid = await bcrypt.compare(password, user.password);
+  if (!valid) return res.json({ success: false });
+
+  const token = jwt.sign(
+    { id: user._id, role: "player", username: user.username },
+    process.env.JWT_SECRET,
+    { expiresIn: "2h" }
+  );
+
+  res.json({ success: true, token });
+});
+
+/* ===================== CREATE PLAYER ===================== */
+app.post("/create-player", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const { username, password } = req.body;
+
+  if (!username || !password)
+    return res.json({ success: false, message: "Missing fields" });
+
+  const exist = await User.findOne({ username });
+  if (exist)
+    return res.json({ success: false, message: "User exists" });
+
+  const hash = await bcrypt.hash(password, 10);
+
+  await User.create({
+    username,
+    password: hash,
+    role: "player"
+  });
+
+  res.json({ success: true });
+});
+
+/* ===================== GET PLAYERS ===================== */
+app.get("/players", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const users = await User.find({}, "-password");
+  res.json(users);
+});
+
+/* ===================== EDIT PLAYER ===================== */
+app.put("/edit-player/:id", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const { username, password } = req.body;
+  const updateData = {};
+
+  if (username) updateData.username = username;
+
+  if (password) {
+    const hash = await bcrypt.hash(password, 10);
+    updateData.password = hash;
+  }
+
+  await User.findByIdAndUpdate(req.params.id, updateData);
+
+  res.json({ success: true });
+});
+
+/* ===================== SET SPIN (ADMIN) ===================== */
+app.put("/set-spin/:id", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const { spins } = req.body;
+
+  if (spins == null)
+    return res.json({ success: false, message: "Missing spins value" });
+
+  await User.findByIdAndUpdate(req.params.id, {
+    spinsLeft: Number(spins)
+  });
+
+  res.json({ success: true });
+});
+
+/* ===================== DELETE PLAYER ===================== */
+app.delete("/delete/:id", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  await User.findByIdAndDelete(req.params.id);
+
+  res.json({ success: true });
+});
+
+/* ===================== ADMIN VIEW USER HISTORY (WITH DATE FILTER)===================== */
+app.get("/api/admin/user-history/:userId", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const { start, end } = req.query;
+
+  let filter = { userId: req.params.userId };
+
+  if (start && end) {
+    filter.createdAt = {
+      $gte: new Date(start),
+      $lte: new Date(end)
+    };
+  }
+
+  const spins = await Spin.find(filter).sort({ createdAt: -1 });
+
+  res.json(spins);
+});
+/* ===================== ADMIN DELETE SINGLE SPIN ===================== */
+app.delete("/admin/clear-history/:id", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  try {
+    await Spin.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    console.log(err);
+    res.json({ success: false });
+  }
+});
+/* ===================== PLAYER SPIN ===================== */
+app.post("/spin", verifyToken, async (req, res) => {
+
+  console.log("🔥 /spin called");
+  console.log("User ID from token:", req.user.id);
+  console.log("Username:", req.user.username);
+
+  if (req.user.role !== "player")
+    return res.status(403).json({ message: "Player Only" });
+
+  const user = await User.findById(req.user.id);
+  if (!user){
+    console.log("❌ User not found in DB");
+    return res.status(404).json({ message: "User not found" });
+  }
+
+  console.log("Current spinsLeft:", user.spinsLeft);
+
+  if (user.spinsLeft <= 0)
+    return res.status(400).json({ message: "No spins remaining" });
+
+  // 🎯 Load probability
+  let setting = await PrizeSetting.findOne();
+
+  if (!setting || !setting.values){
+    console.log("❌ Prize settings not found");
+    return res.status(500).json({ message: "Prize settings not found" });
+  }
+
+  const valuesObject =
+    setting.values instanceof Map
+      ? Object.fromEntries(setting.values)
+      : setting.values;
+
+  const prizeConfig = Object.entries(valuesObject).map(([value, weight]) => ({
+    value: Number(value),
+    weight: Number(weight)
+  }));
+
+  console.log("Prize config:", prizeConfig);
+
+  // 🎯 Weighted random
+  const totalWeight = prizeConfig.reduce((sum, p) => sum + p.weight, 0);
+  const random = Math.random() * totalWeight;
+
+  let cumulative = 0;
+  let selectedPrize = 0;
+
+  for (const item of prizeConfig) {
+    cumulative += item.weight;
+    if (random <= cumulative) {
+      selectedPrize = item.value;
+      break;
+    }
+  }
+
+  console.log("🎯 Selected prize:", selectedPrize);
+
+  // ✅ Update user
+  user.spinsLeft -= 1;
+  user.balance += selectedPrize;
+  // 🎁 50$ → +1 Free Spin
+let freeSpinReward = 0;
+
+if(selectedPrize === 50){
+  user.spinsLeft += 1;
+  freeSpinReward = 1;
+}
+  await user.save();
+
+  console.log("💰 New balance:", user.balance);
+  console.log("🎫 Spins left after spin:", user.spinsLeft);
+
+  const prizeLabels = {
+  0: "ព្យាយាមម្ដងទៀត",
+  5: "អ្នកឈ្នះ1$",
+  10: "អ្នកឈ្នះ10$",
+  20: "អាវ​ SBC369",
+  30: "ម៉ូតូ​ scoopy 2025",
+  50: "Free 1 spin",
+  100: "អ្នកឈ្នះSpeaker JBL",
+  200: "I PHONE 17 Pro Max"
+};
+
+await Spin.create({
+  userId: user._id,
+  username: user.username,
+  prize: selectedPrize,
+  prizeLabel: prizeLabels[selectedPrize] || selectedPrize
+});
+
+  console.log("💾 Spin saved to database!");
+
+  res.json({
+    prize: selectedPrize,
+    spinsLeft: user.spinsLeft,
+    balance: user.balance
+  });
+});
+
+/* ===================== ADMIN SEE ALL SPINS ===================== */
+app.get("/api/spins", verifyToken, async (req, res) => {
+  if (req.user.role !== "admin")
+    return res.status(403).json({ message: "Admin Only" });
+
+  const spins = await Spin.find().sort({ createdAt: -1 });
+  res.json(spins);
+});
+
+/* ===================== LEADERBOARD ===================== */
+app.get("/api/leaderboard", async (req, res) => {
+  const leaderboard = await Spin.aggregate([
+    {
+      $group: {
+        _id: "$username",
+        totalSpins: { $sum: 1 }
+      }
+    },
+    { $sort: { totalSpins: -1 } }
+  ]);
+
+  res.json(leaderboard);
+});
+
+/* ===================== MY SPIN INFO ===================== */
+app.get("/api/my-spin", verifyToken, async (req, res) => {
+  const user = await User.findById(req.user.id);
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  res.json({
+    spinsLeft: user.spinsLeft,
+    balance: user.balance
+  });
+});
+
+/* ===================== MY HISTORY ===================== */
+app.get("/api/history", verifyToken, async (req, res) => {
+  const spins = await Spin.find({ userId: req.user.id })
+    .sort({ createdAt: -1 });
+
+  res.json(spins);
+});
+
+/* ===================== HTML ROUTES ===================== */
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.get("/admin", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin.html"));
+});
+
+app.get("/player", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "player-page.html"));
+});
+
+/* ===================== START SERVER ===================== */
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("🚀 Server running on port " + PORT);
+});
