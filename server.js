@@ -14,7 +14,29 @@ mongoose.connect(process.env.MONGO_URI)
 .then(()=>console.log("✅ MongoDB Connected"))
 .catch(err=>console.log("❌ Mongo Error:",err));
 
+/* ===================== CREATE SUPERADMIN ===================== */
 
+async function createSuperAdmin(){
+
+  const exist = await User.findOne({role:"superadmin"});
+
+  if(!exist){
+
+    const hash = await bcrypt.hash("admin999",10);
+
+    await User.create({
+      username:"admin1",
+      password:hash,
+      role:"superadmin",
+      prefix:"CBPAABCC"
+    });
+
+    console.log("✅ Superadmin created");
+  }
+
+}
+
+createSuperAdmin();
 /* ===================== MIDDLEWARE ===================== */
 
 app.use(express.json());
